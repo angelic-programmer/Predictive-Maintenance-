@@ -2,6 +2,7 @@ import pandas as pd
 
 df_maintenance = pd.read_csv("predictive_maintenance.csv")
 
+<<<<<<< HEAD
 
 #från scikit-learn-biblioteket hämtar jag train_test_split och RandomForestClassifier som kan klassificera y till 0 eller 1.
 from sklearn.model_selection import train_test_split
@@ -30,3 +31,6 @@ print(classification_report(y_test, y_pred))
 
 print("Confusion matrix:")
 print(confusion_matrix(y_test, y_pred))
+=======
+print(df_maintenance.head())
+>>>>>>> 1352c9d440b62a363f59127c8d2c14787fc56e0d
