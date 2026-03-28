@@ -24,12 +24,13 @@ import pandas as pd
 from pathlib import Path
 from sgu_client import SGUClient
 
-CACHE_PATH = Path(__file__).parent / "ref_cache.json"
-METADATA   = Path(__file__).parent / "stationer_metadata.csv"
-BASE_ID    = "22W102"
-MAX_ATTEMPTS = 50      # prova max 50 stationer
-MAX_DOWNLOAD = 15      # spara max 15 giltiga
-SLEEP_SECS   = 3       # paus mellan anrop
+CACHE_PATH_GEO = Path(__file__).parent / "ref_cache.json"
+CACHE_PATH_ALL = Path(__file__).parent / "ref_cache_all.json"
+METADATA       = Path(__file__).parent / "stationer_metadata.csv"
+BASE_ID        = "22W102"
+MAX_ATTEMPTS   = 50      # prova max 50 stationer
+MAX_DOWNLOAD   = 15      # spara max 15 giltiga
+SLEEP_SECS     = 3       # paus mellan anrop
 
 
 def fetch_one_station(sid: str) -> dict:
@@ -53,18 +54,34 @@ def fetch_one_station(sid: str) -> dict:
 
 
 def main():
-    # 1. Läs metadata
-    meta = pd.read_csv(METADATA)
-    row  = meta[meta["station_id"] == BASE_ID].iloc[0]
-    akvifer, jordart = row["akvifer"], row["jordart"]
-    print(f"Basröret {BASE_ID}: akvifer={akvifer}, jordart={jordart}")
+    import argparse
+    parser = argparse.ArgumentParser(description="Hämta kandidatrör från SGU API")
+    parser.add_argument("--all", action="store_true",
+                        help="Hämta ALLA stationer oavsett akvifer/jordart "
+                             "(sparar till ref_cache_all.json)")
+    args = parser.parse_args()
 
-    # 2. Hämta kandidater från OGC API
+    geo_filter = not args.all
+    cache_path = CACHE_PATH_GEO if geo_filter else CACHE_PATH_ALL
+
+    # 1. Hämta kandidater från OGC API
     url = ("https://api.sgu.se/oppnadata/grundvattennivaer-observerade"
            "/ogc/features/v1/collections/stationer/items")
-    resp = requests.get(url, params={"akvifer": akvifer, "jordart": jordart,
-                                     "limit": 500, "f": "json"},
-                        timeout=30, verify=False)
+
+    if geo_filter:
+        # Filtrerat på samma akvifer+jordart som basröret
+        meta = pd.read_csv(METADATA)
+        row  = meta[meta["station_id"] == BASE_ID].iloc[0]
+        akvifer, jordart = row["akvifer"], row["jordart"]
+        print(f"Basröret {BASE_ID}: akvifer={akvifer}, jordart={jordart}")
+        params = {"akvifer": akvifer, "jordart": jordart,
+                  "limit": 500, "f": "json"}
+    else:
+        # Utan geologiskt filter — hämtar alla stationer
+        print(f"Hämtar ALLA stationer (ingen geologisk filtrering)")
+        params = {"limit": 500, "f": "json"}
+
+    resp = requests.get(url, params=params, timeout=30, verify=False)
     resp.raise_for_status()
     features = resp.json().get("features", [])
     candidates = [
@@ -72,12 +89,15 @@ def main():
         for f in features
         if f["properties"].get("platsbeteckning") not in (None, BASE_ID)
     ][:MAX_ATTEMPTS]
-    print(f"Hämtar tidsserier för {len(candidates)} kandidatstationer …")
+
+    filter_label = f"akvifer={akvifer}, jordart={jordart}" if geo_filter else "alla"
+    print(f"SGU API returnerade {len(candidates)} kandidatrör ({filter_label})")
+    print(f"Sparar till: {cache_path}")
     print(f"(ny SGUClient per station, {SLEEP_SECS}s paus mellan anrop)\n")
 
-    # 3. Läs in eventuell befintlig cache (inkrementell)
-    if CACHE_PATH.exists():
-        with open(CACHE_PATH) as f:
+    # 2. Läs in eventuell befintlig cache (inkrementell)
+    if cache_path.exists():
+        with open(cache_path) as f:
             results = json.load(f)
         print(f"Befintlig cache laddad: {len(results)} stationer")
     else:
@@ -85,7 +105,7 @@ def main():
 
     n_ok = sum(1 for v in results.values() if "__error__" not in v)
 
-    # 4. Hämta varje station — ny SGUClient per anrop
+    # 3. Hämta varje station — ny SGUClient per anrop
     for i, sid in enumerate(candidates, 1):
         if n_ok >= MAX_DOWNLOAD:
             print(f"\n✓ {MAX_DOWNLOAD} giltiga rör hämtade — stoppar.")
@@ -108,16 +128,16 @@ def main():
             print(f"  [{i}/{len(candidates)}] ✗ {sid}: {e} ({time.time()-t0:.1f}s)")
 
         # Spara inkrementellt efter varje station
-        with open(CACHE_PATH, "w") as f:
+        with open(cache_path, "w") as f:
             json.dump(results, f)
 
         # Paus innan nästa anrop
         time.sleep(SLEEP_SECS)
 
-    # 5. Sammanfattning
+    # 4. Sammanfattning
     ok_count   = sum(1 for v in results.values() if "__error__" not in v)
     fail_count = sum(1 for v in results.values() if "__error__" in v)
-    print(f"\n✓ Cache sparad till {CACHE_PATH}")
+    print(f"\n✓ Cache sparad till {cache_path}")
     print(f"  Giltiga: {ok_count}, Misslyckade: {fail_count}, Totalt: {len(results)}")
 
 

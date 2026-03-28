@@ -1,4 +1,6 @@
 import matplotlib
+matplotlib.use("Agg")          # Icke-interaktiv backend – sparar PNG utan plt.show()-blockering
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -123,37 +125,64 @@ def load_candidate_stations(
 
     max_download = 10
 
-    # Läs från cache (ref_cache.json) — kör fetch_candidates.py separat om cachen saknas
+    # ── Strategi 1: läs från cache (ref_cache.json) ──
     cache_path = Path(__file__).parent / "ref_cache.json"
-    if not cache_path.exists():
-        raise FileNotFoundError(
-            f"Cache saknas: {cache_path}\n"
-            "Kör först: py fetch_candidates.py"
-        )
-    import json
-    print(f"  Läser cache: {cache_path}")
-    with open(cache_path) as f:
-        all_data = json.load(f)
-    for sid, records in all_data.items():
-        if "__error__" in records:
-            continue
-        s = pd.Series({pd.Timestamp(k): v for k, v in records.items()}, dtype=float)
-        s = s.sort_index()
-        if s.index.tz is not None:
-            s.index = s.index.tz_localize(None)
-        s = pd.to_numeric(s, errors="coerce")
-        overlap = s[(s.index >= base_start) & (s.index <= base_end)].dropna()
-        if len(overlap) >= min_overlap_weeks:
-            result.append((sid, s))
-            print(f"  ✓ {sid}: {len(overlap)} överlappande obs (cache)")
-        if len(result) >= max_download:
-            break
+    if cache_path.exists():
+        import json
+        print(f"  Läser cache: {cache_path}")
+        with open(cache_path) as f:
+            all_data = json.load(f)
+        for sid, records in all_data.items():
+            if "__error__" in records:
+                continue
+            s = pd.Series({pd.Timestamp(k): v for k, v in records.items()}, dtype=float)
+            s = s.sort_index()
+            if s.index.tz is not None:
+                s.index = s.index.tz_localize(None)
+            s = pd.to_numeric(s, errors="coerce")
+            overlap = s[(s.index >= base_start) & (s.index <= base_end)].dropna()
+            if len(overlap) >= min_overlap_weeks:
+                result.append((sid, s))
+                print(f"  ✓ {sid}: {len(overlap)} överlappande obs (cache)")
+            if len(result) >= max_download:
+                break
+    else:
+        # ── Strategi 2: direkt API-hämtning (kan hänga på Windows pga SSL) ──
+        print("  ⚠ Ingen cache hittad — kör: py fetch_candidates.py")
+        print("  Försöker hämta direkt (kan hänga) …")
+        import time
+        for sid in candidates[:50]:
+            if len(result) >= max_download:
+                break
+            try:
+                s = load_reference_station(sid)
+                overlap = s[(s.index >= base_start) & (s.index <= base_end)].dropna()
+                if len(overlap) >= min_overlap_weeks:
+                    result.append((sid, s))
+                    print(f"  ✓ {sid}: {len(overlap)} överlappande obs")
+                else:
+                    print(f"  ✗ {sid}: för få obs ({len(overlap)} < {min_overlap_weeks})")
+            except Exception as e:
+                print(f"  ✗ {sid}: fel ({e})")
+            time.sleep(2.0)
 
     # Om inga kandidater hittades, fall tillbaka på 95_2
     if not result:
         print("\nVarning: inga kandidatrör hittades — faller tillbaka på 95_2")
         ref = load_reference_station("95_2")
         return [("95_2", ref)]
+
+    # Sortera efter flest överlappande obs — så att max_refs väljer de bästa rören
+    result_with_count = []
+    for sid, s in result:
+        s2 = s.copy()
+        if s2.index.tz is not None:
+            s2.index = s2.index.tz_localize(None)
+        n_overlap = len(s2[(s2.index >= base_start) & (s2.index <= base_end)].dropna())
+        result_with_count.append((sid, s, n_overlap))
+    result_with_count.sort(key=lambda x: x[2], reverse=True)
+    result = [(sid, s) for sid, s, _ in result_with_count]
+    print(f"\nRören sorterade efter överlappning. Topp 5: {[sid for sid, _ in result[:5]]}")
 
     return result
 
@@ -580,6 +609,202 @@ class GroundwaterSSM_Multi(MLEModel):
 
 
 # ─────────────────────────────────────────────
+#  MULTIVARIAT MODELL MED TIDSVARIERANDE β (TVP)
+# ─────────────────────────────────────────────
+
+#  Litteraturreferens: Durbin & Koopman (2012), kap. 3.4
+#  "Time Series Analysis by State Space Methods", 2nd ed.
+#
+#  Istället för konstant β_i skattas β_i(t) som en latent variabel
+#  (random walk), vilket fångar att den hydrauliska kopplingen mellan
+#  brunnar kan variera över tid.
+#
+#  Tillståndsvektor (27 + n_refs states):
+#    [µ, γ_0, …, γ_25, β_1(t), …, β_n(t)]
+#
+#  Observation:
+#    y_base  = µ + γ_0                                   (exakt, sigma2_eps=0)
+#    y_ref_i = alpha_i + β_i(t) · µ + gamma_i · γ_0     (med obs-brus)
+#
+#  OBS: β_i(t)·µ(t) är en produkt av två latenta tillstånd → icke-linjärt.
+#  Linearisering: vi approximerar µ(t) ≈ E[µ] ≈ mean(y_base) i Z-matrisen
+#  så att Z[ref_i, state_β_i] = µ_approx.  Kalman-filtret kompenserar delvis
+#  för approximationen via innovationsuppdateringen.
+
+class GroundwaterSSM_Multi_TVP(MLEModel):
+    """
+    Multivariat SSM med tidsvarierande β_i(t).
+    β_i(t) är latenta tillstånd som följer random walks.
+    Relaxerar antagande A6 (tidsinvarians i observationsekvationen).
+    """
+
+    def __init__(self, endog, nseason=26, ref_ids=None, **kwargs):
+        self.nseason = nseason
+        self.ref_ids = ref_ids if ref_ids is not None else []
+        self.n_refs  = len(self.ref_ids)
+
+        # States: µ + 26 säsong + n_refs tidsvarierande β_i(t)
+        k_states = 1 + nseason + self.n_refs
+        # Chockkällor: η_level + η_season + ζ_1 + … + ζ_n
+        self._k_posdef = 2 + self.n_refs
+
+        super().__init__(
+            endog,
+            k_states=k_states,
+            k_posdef=self._k_posdef,
+            **kwargs,
+        )
+
+        # Parameternamn:
+        #   2 processvarianser (nivå, säsong)
+        #   per ref: σ²_eps_i, σ²_zeta_i, alpha_i, gamma_i
+        # OBS: β_i är nu LATENT (inte en fast parameter)
+        self._param_names = ["sigma2_eta_level", "sigma2_eta_season"]
+        for rid in self.ref_ids:
+            self._param_names += [
+                f"sigma2_eps_{rid}",    # observationsbrus ref_i
+                f"sigma2_zeta_{rid}",   # processbrus för β_i(t)
+                f"alpha_{rid}",         # intercept ref_i
+                f"gamma_{rid}",         # säsongsladdning ref_i
+            ]
+
+        self.ssm.initialize_approximate_diffuse()
+
+    @property
+    def param_names(self):
+        return self._param_names
+
+    @property
+    def start_params(self):
+        import statsmodels.api as sm
+
+        y1 = self.endog[:, 0]
+
+        # Univariat modell för startgissning av processvarianser
+        mod = sm.tsa.UnobservedComponents(
+            y1, level="local level", seasonal=self.nseason
+        )
+        res = mod.fit(disp=False, method="nm", maxiter=500)
+
+        sigma2_eta_level  = float(res.params[1])
+        sigma2_eta_season = float(res.params[2])
+
+        params = [sigma2_eta_level, sigma2_eta_season]
+
+        level  = res.level.smoothed
+        season = res.seasonal.smoothed
+
+        # OLS per referensrör: y_ref = alpha + beta*level + gamma*season
+        for i in range(self.n_refs):
+            y_ref = self.endog[:, 1 + i]
+            mask  = ~(np.isnan(y_ref) | np.isnan(level) | np.isnan(season))
+            X     = np.column_stack([np.ones(mask.sum()), level[mask], season[mask]])
+            ols   = np.linalg.lstsq(X, y_ref[mask], rcond=None)
+            alpha_i  = float(ols[0][0])
+            gamma_i  = float(ols[0][2])
+            s2_eps_i = float(np.var(y_ref[mask] - X @ ols[0]))
+            # σ²_zeta startar litet — β_i(t) bör vara nästan konstant initialt
+            s2_zeta_i = 1e-4
+            params  += [max(s2_eps_i, 1e-6), s2_zeta_i, alpha_i, gamma_i]
+
+        return np.array(params)
+
+    def transform_params(self, unconstrained):
+        p = unconstrained.copy()
+        p[0] = np.exp(unconstrained[0])   # sigma2_eta_level > 0
+        p[1] = np.exp(unconstrained[1])   # sigma2_eta_season > 0
+        for i in range(self.n_refs):
+            base = 2 + 4 * i
+            p[base]     = np.exp(unconstrained[base])      # sigma2_eps_i > 0
+            p[base + 1] = np.exp(unconstrained[base + 1])  # sigma2_zeta_i > 0
+            # alpha_i, gamma_i obegränsade
+        return p
+
+    def untransform_params(self, constrained):
+        p = constrained.copy()
+        p[0] = np.log(constrained[0])
+        p[1] = np.log(constrained[1])
+        for i in range(self.n_refs):
+            base = 2 + 4 * i
+            p[base]     = np.log(constrained[base])
+            p[base + 1] = np.log(constrained[base + 1])
+        return p
+
+    def update(self, params, **kwargs):
+        params = super().update(params, **kwargs)
+
+        s2_level  = params[0]
+        s2_season = params[1]
+        ref_params = [
+            (params[2 + 4*i], params[3 + 4*i], params[4 + 4*i], params[5 + 4*i])
+            for i in range(self.n_refs)
+        ]
+        # ref_params[i] = (sigma2_eps_i, sigma2_zeta_i, alpha_i, gamma_i)
+
+        ns      = self.nseason        # 26
+        n_refs  = self.n_refs
+        k       = self.k_states       # 27 + n_refs
+        n_endog = 1 + n_refs
+        kp      = self._k_posdef      # 2 + n_refs
+
+        # ── Transitionsmatris T (k×k) ────────────────────────────────────
+        T = np.zeros((k, k))
+        T[0, 0] = 1.0                      # µ(t+1) = µ(t)
+        T[1, 1:1+ns] = -1.0                # Säsong: sum-to-zero (Harvey)
+        for j in range(1, ns):
+            T[1 + j, 1 + j - 1] = 1.0
+        for i in range(n_refs):
+            T[1 + ns + i, 1 + ns + i] = 1.0  # β_i(t+1) = β_i(t)
+        self.ssm["transition"] = T
+
+        # ── Observationsmatris Z (n_endog × k) ──────────────────────────
+        # y_base  = 1·µ + 1·γ_0
+        # y_ref_i = alpha_i + β_i(t)·µ + gamma_i·γ_0
+        #
+        # β_i(t)·µ(t) är icke-linjärt.  Linearisering:
+        #   Vi placerar β_i(t)-state i kolumnen och multiplicerar med
+        #   µ_approx ≈ mean(y_base).  Filtrets innovationsuppdatering
+        #   korrigerar avvikelsen.
+        Z = np.zeros((n_endog, k))
+        Z[0, 0] = 1.0   # base ← µ
+        Z[0, 1] = 1.0   # base ← γ_0
+
+        mu_approx = float(np.nanmean(self.endog[:, 0]))
+        for i, (_, _, _, gamma_i) in enumerate(ref_params):
+            Z[1 + i, 1 + ns + i] = mu_approx   # β_i(t) × µ_approx
+            Z[1 + i, 1]          = gamma_i      # γ_0 × gamma_i
+        self.ssm["design"] = Z
+
+        # ── Observationsintercept d (n_endog × 1) ───────────────────────
+        d = np.zeros((n_endog, 1))
+        for i, (_, _, alpha_i, _) in enumerate(ref_params):
+            d[1 + i, 0] = alpha_i
+        self.ssm["obs_intercept"] = d
+
+        # ── Observationsbrus H (n_endog × n_endog) ──────────────────────
+        H = np.zeros((n_endog, n_endog))
+        for i, (s2_eps_i, _, _, _) in enumerate(ref_params):
+            H[1 + i, 1 + i] = s2_eps_i
+        self.ssm["obs_cov"] = H
+
+        # ── Processkörsbrus Q (kp × kp) ─────────────────────────────────
+        Q = np.zeros((kp, kp))
+        Q[0, 0] = s2_level
+        Q[1, 1] = s2_season
+        for i, (_, s2_zeta_i, _, _) in enumerate(ref_params):
+            Q[2 + i, 2 + i] = s2_zeta_i
+        self.ssm["state_cov"] = Q
+
+        # ── Selektionsmatris R (k × kp) ─────────────────────────────────
+        R = np.zeros((k, kp))
+        R[0, 0] = 1.0          # η_level  → state 0 (µ)
+        R[1, 1] = 1.0          # η_season → state 1 (γ_0)
+        for i in range(n_refs):
+            R[1 + ns + i, 2 + i] = 1.0  # ζ_i → state 27+i (β_i)
+        self.ssm["selection"] = R
+
+
+# ─────────────────────────────────────────────
 #  ANPASSA OCH PREDIKTERA
 # ─────────────────────────────────────────────
 
@@ -612,6 +837,27 @@ def fit_model_multi(df: pd.DataFrame, nseason: int = 26) -> tuple:
     # (lbfgs med 18+ parametrar kräver ~18 Kalman-filter per gradient)
     # cov_type="none" — hoppa över OPG-kovariansberäkning som kräver
     # ytterligare 18 × complex-step Kalman-filterkörningar
+    result = model.fit(
+        method="powell",
+        maxiter=5000,
+        disp=True,
+        cov_type="none",
+    )
+    print("\n" + "="*50)
+    print(result.summary())
+    return result, model
+
+
+def fit_model_tvp(df: pd.DataFrame, nseason: int = 26) -> tuple:
+    """Anpassar TVP-modellen (tidsvarierande β) och returnerar (result, model)."""
+    ref_ids = [col for col in df.columns if col != "base"]
+    endog   = df[["base"] + ref_ids].values.astype(float)
+
+    model = GroundwaterSSM_Multi_TVP(endog, nseason=nseason, ref_ids=ref_ids)
+
+    print(f"Anpassar TVP-modell med {len(ref_ids)} referensrör: {ref_ids}...")
+    print(f"Tillstånd: {model.k_states} (27 + {len(ref_ids)} tidsvarierande β)")
+    print(f"Parametrar: {len(model.param_names)}")
     result = model.fit(
         method="powell",
         maxiter=5000,
@@ -656,6 +902,16 @@ def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
         freq="7D",
     )
 
+    # One-step-ahead filter-prediktioner (basröret, rad 0)
+    # Prediktion vid tid t baserat enbart på data t₁, …, t₋₁
+    filter_pred_base = result.filter_results.forecasts[0]
+    filter_pred_var  = result.filter_results.forecasts_error_cov[0, 0]
+    filter_pred_std  = np.sqrt(np.maximum(filter_pred_var, 0))
+    filter_pred_ci   = np.column_stack([
+        filter_pred_base - 1.96 * filter_pred_std,
+        filter_pred_base + 1.96 * filter_pred_std,
+    ])
+
     return {
         "index":          df.index,
         "observed_base":  df["base"].values,
@@ -664,6 +920,8 @@ def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
         "season_var":     season_var,
         "pred_base":      pred_mean,
         "pred_ci":        pred_ci,
+        "filter_pred_base": filter_pred_base,
+        "filter_pred_ci":   filter_pred_ci,
         "fcast_index":    fcast_idx,
         "fcast_base":     fcast_mean,
         "fcast_ci":       fcast_ci,
@@ -684,8 +942,8 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
     Mått som beräknas:
       ── Informationskriterier ──
         Log-likelihood, AIC, BIC, HQIC
-      ── Prediktionsfel (basröret, Kalman-filter one-step-ahead) ──
-        RMSE, MAE, ME (bias)
+      ── Prediktionsfel (basröret, one-step-ahead) ──
+        RMSE, MAE, ME (bias)  — filtrets prediktion ŷ(t|t-1)
       ── Standardiserade innovationer (Kalman-filter) ──
         Medelvärde, Std, Skevhet, Kurtosis  (bör vara ≈ N(0,1))
       ── Restdiagnostik ──
@@ -699,11 +957,12 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
     from scipy import stats as sp_stats
 
     obs  = out["observed_base"]
-    pred = out["pred_base"]
-    ci   = out["pred_ci"]
+    # One-step-ahead filter-prediktioner: ŷ(t|t-1)
+    pred = out["filter_pred_base"]
+    ci   = out["filter_pred_ci"]
 
-    # ── Mask: bara tidpunkter med faktisk observation ─────────────────
-    valid = ~np.isnan(obs)
+    # ── Mask: tidpunkter med faktisk observation OCH giltig prediktion ─
+    valid = ~np.isnan(obs) & ~np.isnan(pred)
     o = obs[valid]
     p = pred[valid]
 
@@ -717,21 +976,18 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
         "Antal obs (T)":     int(result.nobs),
     }
 
-    # ── 2. One-step-ahead prediktionsfel (Kalman-filtret) ────────────
-    #   Filtrets innovation e(t) = y(t) - Z·a(t|t-1) beräknas INNAN
-    #   observationen assimileras — ger meningsfull RMSE även med
-    #   obs_cov = 0 (smoothade residualer ≡ 0 i det fallet).
-    filter_resid = result.filter_results.forecasts_error[0]  # rad 0 = basröret
-    fr_valid = filter_resid[valid & ~np.isnan(filter_resid)]
-    metrics["RMSE"]       = float(np.sqrt(np.mean(fr_valid**2)))
-    metrics["MAE"]        = float(np.mean(np.abs(fr_valid)))
-    metrics["ME (bias)"]  = float(np.mean(fr_valid))
+    # ── 2. Prediktionsfel (basröret, in-sample) ──────────────────────
+    resid = o - p
+    metrics["RMSE"]       = float(np.sqrt(np.mean(resid**2)))
+    metrics["MAE"]        = float(np.mean(np.abs(resid)))
+    metrics["ME (bias)"]  = float(np.mean(resid))
 
     # ── 3. Standardiserade innovationer från Kalman-filtret ──────────
     #   Dessa är e(t) / sqrt(F(t)) — bör vara ≈ N(0,1) om modellen
     #   är korrekt specificerad.  Rad 0 = basröret.
     try:
         std_innov = result.filter_results.standardized_forecasts_error
+        # std_innov shape: (k_endog, T)  —  ta rad 0 (basröret)
         si_base = std_innov[0]
         si_valid = si_base[~np.isnan(si_base)]
         if len(si_valid) > 10:
@@ -742,19 +998,19 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
     except Exception:
         pass
 
-    # ── 4. Ljung-Box test (lag 10) för autokorrelation i innovationer ─
+    # ── 4. Ljung-Box test (lag 10) för autokorrelation i residualer ──
     try:
         from statsmodels.stats.diagnostic import acorr_ljungbox
-        lb = acorr_ljungbox(fr_valid, lags=[10], return_df=True)
+        lb = acorr_ljungbox(resid, lags=[10], return_df=True)
         metrics["Ljung-Box Q(10)"] = float(lb["lb_stat"].values[0])
         metrics["Ljung-Box p"]     = float(lb["lb_pvalue"].values[0])
     except Exception:
         pass
 
-    # ── 5. Durbin-Watson (autokorrelation av ordning 1) ──────────────
+    # ── 5. Durbin-Watson (autokorreation av ordning 1) ───────────────
     try:
         from statsmodels.stats.stattools import durbin_watson
-        metrics["Durbin-Watson"] = float(durbin_watson(fr_valid))
+        metrics["Durbin-Watson"] = float(durbin_watson(resid))
     except Exception:
         pass
 
@@ -995,9 +1251,9 @@ if __name__ == "__main__":
     print("\n✓ All data hämtad — startar modellanpassning\n")
 
     # Initiera resultatvariabler
-    result_base = result_multi = None
-    out_base = out_multi = None
-    metrics_base = metrics_multi = None
+    result_base = result_multi = result_tvp = None
+    out_base = out_multi = out_tvp = None
+    metrics_base = metrics_multi = metrics_tvp = None
 
     # ── STEG 2: BASLINJEMODELL ────────────────────────────────────────────
     if MODE in ("baseline", "both"):
@@ -1112,6 +1368,76 @@ if __name__ == "__main__":
             print(f"  {k:<40} = {v:.6f}")
 
 
+    # ── STEG 4: TVP-MODELL (tidsvarierande β) ────────────────────────────
+    if MODE in ("tvp", "both"):
+        print("\n" + "="*60)
+        print("TVP-MODELL — tidsvarierande β (Durbin & Koopman 2012)")
+        print("="*60)
+
+        # Använd samma data som multivariatmodellen
+        if df_multi is None:
+            print("--- Hämtar kandidatrör från SGU API (TVP) ---")
+            refs = load_candidate_stations(base)
+            df_multi = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=4)
+
+        ref_ids_tvp = [col for col in df_multi.columns if col != "base"]
+        print(f"\nAnvänder {len(ref_ids_tvp)} referensrör: {ref_ids_tvp}")
+        print(f"Gemensamt dataset: {len(df_multi)} veckor "
+              f"({df_multi.index[0].date()} – {df_multi.index[-1].date()})")
+
+        # Anpassa TVP-modellen
+        print("\n=== Anpassar TVP-modell ===")
+        result_tvp, model_tvp = fit_model_tvp(df_multi, nseason=26)
+
+        # Kör Kalman smoother + prognos
+        print("\n=== Kör Kalman smoother + prognos (TVP) ===")
+        out_tvp = smooth_and_forecast(result_tvp, df_multi, n_forecast=26)
+
+        # Imputation
+        imputed_tvp = imputation_report(df_multi, out_tvp)
+
+        # Avvikelsedetektering
+        anomaly_tvp = detect_anomalies(
+            observed=out_tvp["observed_base"],
+            pred_ci=out_tvp["pred_ci"],
+            min_consecutive=3,
+        )
+        n_anom = anomaly_tvp.sum()
+        print(f"\nAvvikelsedetektering (TVP): {n_anom} tidpunkter flaggade "
+              f"({n_anom/len(anomaly_tvp)*100:.1f}%)")
+
+        # Plotta och spara
+        try:
+            print("\n=== Genererar plot (TVP) ===")
+            fig_tvp = plot_results(out_tvp, anomaly_tvp,
+                                    ref_label=", ".join(ref_ids_tvp) + " (TVP)")
+            fig_tvp.savefig("groundwater_ssm_tvp.png", dpi=150, bbox_inches="tight")
+            print("Plot sparad till: groundwater_ssm_tvp.png")
+            plt.close(fig_tvp)
+        except (Exception, KeyboardInterrupt) as e:
+            print(f"⚠ Plottning (TVP) misslyckades: {type(e).__name__}: {e}")
+            plt.close("all")
+
+        # Spara imputerade värden
+        if not imputed_tvp.empty:
+            imputed_tvp.to_csv("imputed_values_tvp.csv")
+            print("Imputerade värden sparade till: imputed_values_tvp.csv")
+
+        # Skattade parametrar
+        print("\n=== Skattade parametrar (TVP) ===")
+        params_tvp = dict(zip(model_tvp.param_names, result_tvp.params))
+        for k, v in params_tvp.items():
+            print(f"  {k:<40} = {v:.6f}")
+
+        # Tidsvarierande β — skriv ut start, slut och standardavvikelse
+        ns = model_tvp.nseason
+        print("\n=== Tidsvarierande β_i(t) — start, slut, std ===")
+        for i, rid in enumerate(ref_ids_tvp):
+            beta_t = result_tvp.smoother_results.smoothed_state[1 + ns + i]
+            print(f"  β_{rid}(t): start={beta_t[0]:.4f}, "
+                  f"slut={beta_t[-1]:.4f}, std={np.std(beta_t):.4f}")
+
+
     # ── UTVÄRDERING & JÄMFÖRELSE ──────────────────────────────────────
     if MODE in ("baseline", "both") and result_base is not None:
         metrics_base = evaluate_model(result_base, out_base,
@@ -1119,13 +1445,25 @@ if __name__ == "__main__":
     if MODE in ("multi", "both") and result_multi is not None:
         metrics_multi = evaluate_model(result_multi, out_multi,
                                        label="Multivariat")
+    if MODE in ("tvp", "both") and result_tvp is not None:
+        metrics_tvp = evaluate_model(result_tvp, out_tvp,
+                                     label="TVP (tidsvar. β)")
 
     if MODE == "both":
         print("\n" + "="*60)
-        print("JÄMFÖRELSE: Baslinje vs Multivariat")
+        print("JÄMFÖRELSE: Baslinje vs Multivariat vs TVP")
         print("="*60)
 
-        # Alla mått som finns i båda modellerna
+        # Samla alla modeller som körts
+        all_metrics = []
+        labels = []
+        if metrics_base is not None:
+            all_metrics.append(metrics_base); labels.append("Baslinje")
+        if metrics_multi is not None:
+            all_metrics.append(metrics_multi); labels.append("Multi")
+        if metrics_tvp is not None:
+            all_metrics.append(metrics_tvp); labels.append("TVP")
+
         comparison_keys = [
             ("── Informationskriterier ──", None),
             ("Log-likelihood", "{:>12.2f}"),
@@ -1133,7 +1471,7 @@ if __name__ == "__main__":
             ("BIC", "{:>12.2f}"),
             ("HQIC", "{:>12.2f}"),
             ("Antal parametrar", "{:>12.0f}"),
-            ("── Prediktionsfel ──", None),
+            ("── Prediktionsfel (one-step-ahead) ──", None),
             ("RMSE", "{:>12.6f}"),
             ("MAE", "{:>12.6f}"),
             ("ME (bias)", "{:>12.6f}"),
@@ -1154,44 +1492,46 @@ if __name__ == "__main__":
             ("Latent total — medel-std", "{:>12.6f}"),
         ]
 
-        print(f"\n  {'Mått':<35} {'Baslinje':>14} {'Multivariat':>14}  Bäst")
-        print(f"  {'-'*75}")
+        # Dynamisk header för valfritt antal modeller
+        header = f"  {'Mått':<35}"
+        for lbl in labels:
+            header += f" {lbl:>14}"
+        header += "  Bäst"
+        print(f"\n{header}")
+        print(f"  {'-'*(35 + 15*len(labels) + 6)}")
 
-        # Mått där lägre är bättre
-        lower_is_better = {"AIC", "BIC", "HQIC", "RMSE", "MAE",
-                           "Ljung-Box Q(10)",
-                           "Latent nivå µ — medel-std",
-                           "Latent säsong γ₀ — medel-std",
-                           "Latent total — medel-std"}
-        # Mått där högre är bättre
+        lower_is_better  = {"AIC", "BIC", "HQIC", "RMSE", "MAE",
+                            "Ljung-Box Q(10)",
+                            "Latent nivå µ — medel-std",
+                            "Latent säsong γ₀ — medel-std",
+                            "Latent total — medel-std"}
         higher_is_better = {"Log-likelihood", "95%-täckning",
-                            "Ljung-Box p", "Antal parametrar"}
-        # Mått där närmare 0 / 1 / 2 är bättre
-        target_value = {"ME (bias)": 0.0, "Innov. medel": 0.0,
-                        "Innov. std": 1.0, "Innov. skevhet": 0.0,
-                        "Innov. kurtosis": 0.0, "Durbin-Watson": 2.0}
+                            "Ljung-Box p"}
+        target_value     = {"ME (bias)": 0.0, "Innov. medel": 0.0,
+                            "Innov. std": 1.0, "Innov. skevhet": 0.0,
+                            "Innov. kurtosis": 0.0, "Durbin-Watson": 2.0}
 
         for key, fmt in comparison_keys:
             if fmt is None:
-                # Rubrikrad
                 print(f"\n  {key}")
                 continue
-            vb = metrics_base.get(key)
-            vm = metrics_multi.get(key)
-            if vb is None or vm is None:
+            vals = [m.get(key) for m in all_metrics]
+            if all(v is None for v in vals):
                 continue
-            sb = fmt.format(vb)
-            sm = fmt.format(vm)
+            row = f"  {key:<35}"
+            for v in vals:
+                row += f" {fmt.format(v) if v is not None else 'N/A':>14}"
 
-            # Bestäm vilken modell som "vinner"
+            # Bestäm bästa modellen
+            valid_vals = [(v, lbl) for v, lbl in zip(vals, labels) if v is not None]
             winner = ""
-            if key in lower_is_better:
-                winner = "← bas" if vb < vm else "multi →" if vm < vb else "="
-            elif key in higher_is_better:
-                winner = "← bas" if vb > vm else "multi →" if vm > vb else "="
-            elif key in target_value:
-                t = target_value[key]
-                winner = "← bas" if abs(vb - t) < abs(vm - t) else \
-                         "multi →" if abs(vm - t) < abs(vb - t) else "="
-
-            print(f"  {key:<35} {sb:>14} {sm:>14}  {winner}")
+            if len(valid_vals) >= 2:
+                if key in lower_is_better:
+                    winner = min(valid_vals, key=lambda x: x[0])[1]
+                elif key in higher_is_better:
+                    winner = max(valid_vals, key=lambda x: x[0])[1]
+                elif key in target_value:
+                    t = target_value[key]
+                    winner = min(valid_vals, key=lambda x: abs(x[0] - t))[1]
+            row += f"  {winner}"
+            print(row)
