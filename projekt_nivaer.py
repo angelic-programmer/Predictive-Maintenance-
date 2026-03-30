@@ -11,25 +11,45 @@ warnings.filterwarnings("ignore")
 
 try:
     from statsmodels.tsa.statespace.mlemodel import MLEModel
+    from statsmodels.tsa.stattools import acf as sm_acf
 except ImportError:
     raise ImportError("Installera statsmodels: pip install statsmodels")
 
 
-basror_22W102 = Path(__file__).parent / "22W102.csv"
-metadata_path = Path(__file__).parent / "stationer_metadata.csv"
+basror_22W102  = Path(__file__).parent / "22W102.csv"
+basror_17XX01U = Path(__file__).parent / "17XX01U.csv"
+basror_G1101   = Path(__file__).parent / "G1101.csv"
+metadata_path  = Path(__file__).parent / "stationer_metadata.csv"
 
-# Vi skapar en dataframe i pandas av basror_22W102
-def load_base_station(filepath: Path = basror_22W102) -> pd.Series:
+# Vi skapar en dataframe i pandas av basröret
+def load_base_station(filepath: Path = basror_G1101) -> pd.Series:
     # Här är en funktion som tar en filsökväg som argument, basror_22W102 är defaultvärdet
+    # Detektera separator automatiskt (semikolon eller komma)
+    with open(filepath, encoding="utf-8-sig") as f:
+        first_line = f.readline()
+    sep = ";" if ";" in first_line else ","
+    # Detektera om filen har rubrikrad (första fältet är inte ett datum)
+    first_field = first_line.split(sep)[0].strip()
+    try:
+        pd.to_datetime(first_field)
+        skiprows = 0
+    except Exception:
+        skiprows = 1
     df = pd.read_csv(
         filepath,
-        sep=";",
+        sep=sep,
         header=None,
         names=["date", "level"],
+        skiprows=skiprows,
         encoding="utf-8-sig",
     )
     # Nedan läser vi in csv-filen till en DataFrame med kolumnerna date och level
-    df["date"] = pd.to_datetime(df["date"], format="%Y-%m-%d")
+    for fmt in ["%Y-%m-%d", "%y/%m/%d", "%d/%m/%Y"]:
+        try:
+            df["date"] = pd.to_datetime(df["date"], format=fmt)
+            break
+        except (ValueError, TypeError):
+            continue
     df["level"] = (
         df["level"]
         .astype(str)
@@ -40,7 +60,10 @@ def load_base_station(filepath: Path = basror_22W102) -> pd.Series:
     # tomma värden blir NaN
     df["level"] = pd.to_numeric(df["level"], errors="coerce")  
     df = df.set_index("date").sort_index()
-    return df["level"]
+    series = df["level"]
+    # Slå ihop duplicerade datum till medelvärde
+    series = series.groupby(level=0).mean()
+    return series
 
 
 # Hämtar referensrör 95_2 via SGUClient — används av baslinjemodellen
@@ -78,13 +101,17 @@ def load_reference_station(station_id: str = "95_2") -> pd.Series:
 # används av den multivariata modellen
 def load_candidate_stations(
     base_series: pd.Series,
-    base_station_id: str = "22W102",
+    base_station_id: str = "G1101",
     meta_path: Path = metadata_path,
+    ignore_geology: bool = False,
 ) -> list:
     """
     Läser metadata för basröret, hämtar stationer med samma akvifer+jordart
     från SGU OGC API, och returnerar lista med (station_id, pd.Series)
     för rör med överlappning med basröret.
+
+    Om ignore_geology=True hoppas det geologiska filtret över och alla
+    stationer i cachen används som kandidater (väljs sedan på Pearson-korrelation).
     """
     import requests
     import urllib3
@@ -100,23 +127,6 @@ def load_candidate_stations(
     target_jordart = base_row["jordart"]
     print(f"Basröret {base_station_id}: akvifer={target_akvifer}, jordart={target_jordart}")
 
-    # Hämta stationer från SGU OGC API filtrerat på akvifer och jordart
-    url  = ("https://api.sgu.se/oppnadata/grundvattennivaer-observerade"
-            "/ogc/features/v1/collections/stationer/items")
-    resp = requests.get(url, params={"akvifer": target_akvifer, "jordart": target_jordart,
-                                     "limit": 500, "f": "json"}, timeout=30, verify=False)
-    resp.raise_for_status()
-    features   = resp.json().get("features", [])
-
-    # Plocka ut station-ID för alla träffar utom basröret självt
-    candidates = [
-        f["properties"]["platsbeteckning"]
-        for f in features
-        if f["properties"].get("platsbeteckning") not in (None, base_station_id)
-    ]
-    print(f"SGU API returnerade {len(candidates)} kandidatrör "
-          f"(akvifer={target_akvifer}, jordart={target_jordart})")
-
     # Hämta tidsserie för varje kandidat och filtrera på överlappning
     base_start = base_series.dropna().index.min()
     base_end   = base_series.dropna().index.max()
@@ -131,7 +141,31 @@ def load_candidate_stations(
         print(f"  Läser cache: {cache_path}")
         with open(cache_path) as f:
             all_data = json.load(f)
-        for sid, records in all_data.items():
+
+        if ignore_geology:
+            # Använd alla cachade stationer som kandidater (inget geologiskt filter)
+            print("  ignore_geology=True: geologiskt filter bortkopplat — använder hela cachen")
+            cache_candidates = list(all_data.keys())
+        else:
+            # Hämta stationer från SGU OGC API filtrerat på akvifer och jordart
+            url  = ("https://api.sgu.se/oppnadata/grundvattennivaer-observerade"
+                    "/ogc/features/v1/collections/stationer/items")
+            resp = requests.get(url, params={"akvifer": target_akvifer, "jordart": target_jordart,
+                                             "limit": 500, "f": "json"}, timeout=30, verify=False)
+            resp.raise_for_status()
+            features   = resp.json().get("features", [])
+            cache_candidates = [
+                f["properties"]["platsbeteckning"]
+                for f in features
+                if f["properties"].get("platsbeteckning") not in (None, base_station_id)
+            ]
+            print(f"SGU API returnerade {len(cache_candidates)} kandidatrör "
+                  f"(akvifer={target_akvifer}, jordart={target_jordart})")
+
+        for sid in cache_candidates:
+            if sid == base_station_id or sid not in all_data:
+                continue
+            records = all_data[sid]
             if "__error__" in records:
                 continue
             s = pd.Series({pd.Timestamp(k): v for k, v in records.items()}, dtype=float)
@@ -149,6 +183,23 @@ def load_candidate_stations(
         # ── Strategi 2: direkt API-hämtning (kan hänga på Windows pga SSL) ──
         print("  ⚠ Ingen cache hittad — kör: py fetch_candidates.py")
         print("  Försöker hämta direkt (kan hänga) …")
+        # Hämta kandidatlista från API om ingen cache finns
+        url  = ("https://api.sgu.se/oppnadata/grundvattennivaer-observerade"
+                "/ogc/features/v1/collections/stationer/items")
+        params = {"limit": 500, "f": "json"}
+        if not ignore_geology:
+            params["akvifer"] = target_akvifer
+            params["jordart"] = target_jordart
+        import requests, urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        resp = requests.get(url, params=params, timeout=30, verify=False)
+        resp.raise_for_status()
+        features   = resp.json().get("features", [])
+        candidates = [
+            f["properties"]["platsbeteckning"]
+            for f in features
+            if f["properties"].get("platsbeteckning") not in (None, base_station_id)
+        ]
         import time
         for sid in candidates[:50]:
             if len(result) >= max_download:
@@ -226,9 +277,11 @@ def prepare_joint_dataframe_baseline(
     # Skapar ett regelbundet datumindex med en rad per vecka, från start till slut
     idx   = pd.date_range(start, end, freq=freq)
 
-    # Skapar en tom tabell och fyller i närmaste mätning inom 4 dagars tolerans
+    # Basröret: resampla till vecka utan interpolation — Kalmanfiltret hanterar NaN
+    base_weekly = base.groupby(base.index.normalize()).mean().resample(freq).mean()
     df = pd.DataFrame(index=idx)
-    df["base"] = base.reindex(idx, method="nearest", tolerance=pd.Timedelta("4D"))
+    df["base"] = base_weekly.reindex(idx)
+    # Referensröret: behåll interpolation (tätare data, inga långa luckor)
     df["ref"]  = ref.reindex(idx, method="nearest", tolerance=pd.Timedelta("4D"))
 
     return df
@@ -253,9 +306,13 @@ def prepare_joint_dataframe_multi(
     # ── Ranka referensrör efter Pearson-korrelation med basröret ──────
     # (istället för enbart överlappningsantal)
     base_w = _resample_to_weekly(base, freq=freq)
+    # Normalisera till veckoperiod (W-MON) så att alla serier får samma ankare
+    # oavsett vilket datum de börjar på — annars ger resample("7D") olika index
+    base_w.index = base_w.index.to_period("W").to_timestamp()
     corr_list = []
     for sid, s in refs:
         s_w = _resample_to_weekly(s, freq=freq)
+        s_w.index = s_w.index.to_period("W").to_timestamp()
         common = base_w.index.intersection(s_w.index)
         if len(common) < 20:
             continue
@@ -284,19 +341,19 @@ def prepare_joint_dataframe_multi(
         s_w = _resample_to_weekly(s, freq=freq)
         refs_weekly.append((sid, s_w))
 
-    # Här använder jag endast den överlappande perioden där alla tidsserier har data
+    # Använd basrörets fulla datumspann — referensrör som saknar data för
+    # vissa veckor får NaN, vilket Kalmanfiltret hanterar naturligt
     start = base.index.min()
     end   = base.index.max()
-    for _, s in refs_weekly:
-        start = max(start, s.index.min())
-        end   = min(end,   s.index.max())
 
     # Skapar ett regelbundet datumindex med en rad per vecka, från start till slut
     idx = pd.date_range(start, end, freq=freq)
 
-    # Skapar en tom tabell och fyller i närmaste mätning inom 4 dagars tolerans
+    # Basröret: resampla till vecka utan interpolation — Kalmanfiltret hanterar NaN
+    base_weekly = base.groupby(base.index.normalize()).mean().resample(freq).mean()
     df = pd.DataFrame(index=idx)
-    df["base"] = base.reindex(idx, method="nearest", tolerance=pd.Timedelta("4D"))
+    df["base"] = base_weekly.reindex(idx)
+    # Referensrören: behåll interpolation (tätare data, inga långa luckor)
     for sid, s in refs_weekly:
         df[sid] = s.reindex(idx, method="nearest", tolerance=pd.Timedelta("4D"))
 
@@ -488,22 +545,30 @@ class GroundwaterSSM_Multi(MLEModel):
     def start_params(self):
         import statsmodels.api as sm
 
-        y1 = self.endog[:, 0]  # basröret 22W102
+        y1 = self.endog[:, 0]  # basröret
 
-        # Steg 1-2: Anpassa univariat strukturmodell till basröret
-        # Detta ger oss databaserade startgissningar för varianser och säsong
-        mod = sm.tsa.UnobservedComponents(
-            y1, level="local level", seasonal=self.nseason
-        )
-        res = mod.fit(disp=False, method="nm", maxiter=500)
-
-        sigma2_eta_level  = float(res.params[1])  # process noise nivå
-        sigma2_eta_season = float(res.params[2])  # process noise säsong
+        # Steg 1-2: Anpassa univariat strukturmodell till basröret för startgissningar.
+        # Om basen saknar tillräckligt med observationer används enkla standardvärden.
+        y1_valid = y1[~np.isnan(y1)]
+        if len(y1_valid) >= 3:
+            mod = sm.tsa.UnobservedComponents(
+                y1, level="local level", seasonal=self.nseason
+            )
+            res = mod.fit(disp=False, method="nm", maxiter=500)
+            sigma2_eta_level  = float(res.params[1])
+            sigma2_eta_season = float(res.params[2])
+            level  = res.level.smoothed
+            season = res.seasonal.smoothed
+        else:
+            # Basen är helt tom — använd referensrör 1 som proxy för startvärden
+            y_proxy = self.endog[:, 1]
+            y_proxy_valid = y_proxy[~np.isnan(y_proxy)]
+            sigma2_eta_level  = float(np.var(y_proxy_valid)) * 0.01 if len(y_proxy_valid) > 1 else 0.01
+            sigma2_eta_season = sigma2_eta_level * 0.1
+            level  = np.full(len(y1), float(np.nanmean(y_proxy_valid)) if len(y_proxy_valid) > 0 else 0.0)
+            season = np.zeros(len(y1))
 
         params = [sigma2_eta_level, sigma2_eta_season]
-
-        level  = res.level.smoothed
-        season = res.seasonal.smoothed
 
         # Steg 3: OLS för varje referensrör: y_ref = alpha + beta*level + gamma*season
         for i in range(self.n_refs):
@@ -616,6 +681,16 @@ def fit_model_baseline(df: pd.DataFrame, nseason: int = 26) -> tuple:
 
     model = GroundwaterSSM(endog, nseason=nseason)
 
+    # Bättre initiering: sätt startvärdet för nivån till medelvärdet av
+    # basrörets faktiska observationer istället för 0 (diffus P₀=10⁶·I)
+    base_obs = df["base"].dropna().values
+    if len(base_obs) > 0:
+        a0 = np.zeros(model.k_states)
+        a0[0] = float(np.mean(base_obs))  # nivå-state initieras vid observerat medel
+        P0 = np.eye(model.k_states) * 1e6
+        P0[0, 0] = float(np.var(base_obs)) if len(base_obs) > 1 else 1.0
+        model.ssm.initialize_known(a0, P0)
+
     print("Anpassar baslinjemodellen (MLE med Kalman filter)...")
     result = model.fit(
         method="lbfgs",
@@ -714,7 +789,7 @@ def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
 #  MODELLDIAGNOSTIK / UTVÄRDERING
 # ─────────────────────────────────────────────
 
-def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
+def evaluate_model(result, out: dict, label: str = "Modell", station_id: str = "station") -> dict:
     """
     Beräknar diagnostik- och utvärderingsmått för en state-space-modell.
 
@@ -778,13 +853,20 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
 
     # ── Standardiserade innovationer e(t)/√F(t) ─────────────────────
     #   Används för att testa antagande 2 och 3.
+    #   Viktigt: filtrera bort tidpunkter utan faktisk observation —
+    #   statsmodels sätter innovationer till 0 för saknade obs, vilket
+    #   ger ett missvisande histogram (spike vid 0) vid gles mätdata.
     si_valid = None
+    obs_mask = ~np.isnan(obs)   # True där basröret har en riktig mätning
     try:
         std_innov = result.filter_results.standardized_forecasts_error
         # std_innov shape: (k_endog, T)  —  ta rad 0 (basröret)
         si_base = std_innov[0]
+        # Behåll bara tidpunkter med faktisk observation
+        si_base_obs = si_base[obs_mask]
         # Hoppa över diffus initieringsperiod även för innovationer
-        si_after_burn = si_base[burn:]
+        burn_obs = min(burn, len(si_base_obs) - 10)
+        si_after_burn = si_base_obs[burn_obs:]
         si_valid = si_after_burn[~np.isnan(si_after_burn)]
         if len(si_valid) <= 10:
             si_valid = None
@@ -829,8 +911,9 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
     #   standardiserade innovationer.
     metrics["_si_valid"] = si_valid   # sparas för histogram (efter burn-in, för mått)
     # Spara HELA serien (utan burn-in) för ärligare histogram och residualplot
+    # (fortfarande filtrerat på faktiska observationer — inga noll-fyllda luckor)
     try:
-        si_all = si_base[~np.isnan(si_base)]  # alla icke-NaN innovationer
+        si_all = si_base_obs[~np.isnan(si_base_obs)]
         metrics["_si_all"] = si_all if len(si_all) > 10 else si_valid
     except Exception:
         metrics["_si_all"] = si_valid
@@ -879,12 +962,12 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
     if si is not None and len(si) > 10:
         import matplotlib.pyplot as plt
         slug = label.lower().replace(" ", "_").replace("(", "").replace(")", "")
-        fname = f"residual_histogram_{slug}.png"
+        fname = f"residual_histogram_{station_id}_{slug}.png"
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.hist(si, bins=20, color="steelblue", edgecolor="white")
         ax.set_xlabel("Standardiserad innovation")
         ax.set_ylabel("Frekvens")
-        ax.set_title(f"Histogram över basröret 22W102 - State Space")
+        ax.set_title(f"Histogram — {station_id} {label}", fontsize=13)
         fig.tight_layout()
         fig.savefig(fname, dpi=150)
         plt.close(fig)
@@ -894,15 +977,15 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
         resid_vals  = metrics.get("_resid")
         resid_dates = metrics.get("_resid_dates")
         if resid_vals is not None and resid_dates is not None:
-            fname2 = f"residual_tid_{slug}.png"
+            fname2 = f"residual_tid_{station_id}_{slug}.png"
             fig2, ax2 = plt.subplots(figsize=(10, 4))
             ax2.plot(resid_dates, resid_vals,
                      marker="o", markersize=3, linestyle="-",
-                     color="steelblue", linewidth=0.8)
+                     color="steelblue")
             ax2.axhline(0, linestyle="--", color="black", linewidth=0.8)
             ax2.set_xlabel("Datum")
             ax2.set_ylabel("Residual (observation \u2212 prediktion)")
-            ax2.set_title(f"Residualer över tid \u2014 {label} State Space")
+            ax2.set_title(f"Residualer över tid \u2014 {station_id} {label}", fontsize=13)
             ax2.grid(True, alpha=0.3)
             fig2.tight_layout()
             fig2.savefig(fname2, dpi=150)
@@ -954,10 +1037,11 @@ def detect_anomalies(
 # ─────────────────────────────────────────────
 
 def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102",
-                 ref_label: str = "95_2"):
+                 ref_label: str = "95_2", model_label: str = ""):
     fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=False)
+    label_part = f" — {model_label}" if model_label else ""
     fig.suptitle(
-        "Grundvatten State Space Model\n"
+        f"Grundvatten State Space Model{label_part}\n"
         f"Basobjekt: {title_base} | Referens: {ref_label}",
         fontsize=14, fontweight="bold",
     )
@@ -984,7 +1068,7 @@ def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102",
     ax.scatter(anom_idx, anom_obs, color="red", zorder=5, s=30,
                label="Avvikelse (≥3 i följd)", marker="x")
 
-    ax.plot(idx, obs, "o", color="navy", ms=3, alpha=0.7, label="Observation (22W102)")
+    ax.plot(idx, obs, "o", color="navy", ms=3, alpha=0.7, label=f"Observation ({title_base})")
     ax.plot(idx, pred, color="steelblue", lw=1.5, label="Predikterat (in-sample)")
     ax.plot(idx, smoothed, color="darkorange", lw=1.5,
             linestyle="--", label="Kalman-smoothad latent nivå")
@@ -1032,6 +1116,119 @@ def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102",
     return fig
 
 
+def plot_akvifar_style(out: dict, anomaly: pd.Series,
+                       title_base: str, ref_label: str,
+                       model_label: str = ""):
+    """
+    Graf i Akvifär-stil: observationer, prediktioner och osäkerhetsband
+    för hela perioden. Ingen initieringsperiod — Kalmanfiltret uppdateras
+    kontinuerligt och one-step-ahead-prediktionerna är redan ut-av-stickprov.
+    """
+    idx  = out["index"]
+    obs  = out["observed_base"]
+    # Smoother-prediktioner för det visuella (stabilt, ingen diffus-spike)
+    pred = out["pred_base"].flatten()[:len(idx)]
+    ci   = out["pred_ci"][:len(idx)]
+    # Filter-CI (one-step-ahead) för att detektera röda punkter — tätare band
+    filter_ci = out["filter_pred_ci"][:len(idx)]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    label_part = f" — {model_label}" if model_label else ""
+    fig.suptitle(
+        f"Observationer, prediktion och prediktionsintervall{label_part}",
+        fontsize=14, fontweight="bold", y=0.98
+    )
+    ax.set_title(
+        f"Observationsrör: {title_base}, referensrör: {ref_label}",
+        fontsize=11, fontweight="bold", pad=4
+    )
+
+    # Osäkerhetsband (smoother CI)
+    ax.fill_between(idx, ci[:, 0], ci[:, 1],
+                    alpha=0.25, color="steelblue", label="Prediktionsintervall (95%)")
+
+    # Prediktionsvärden
+    ax.plot(idx, pred, marker="o", markersize=3, linestyle="-",
+            linewidth=1.2, color="black", label="Prediktionsvärden")
+
+    # Observationsvärden
+    ax.plot(idx, obs, marker="o", markersize=4, linestyle="-",
+            linewidth=1.5, color="blue", label="Observationsvärden")
+
+    # Röda punkter på observationsvärden (blå) utanför filter-CI
+    utanfor_mask = (
+        ~np.isnan(obs) &
+        ((obs < filter_ci[:, 0]) | (obs > filter_ci[:, 1]))
+    )
+    if utanfor_mask.any():
+        ax.scatter(idx[utanfor_mask], obs[utanfor_mask],
+                   s=50, color="red", zorder=5,
+                   label="Utanför prediktionsintervall")
+
+    ax.set_xlabel("Datum")
+    ax.set_ylabel("Grundvattennivå (m ö.h.)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=4))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30)
+    plt.tight_layout()
+    return fig
+
+
+def plot_acf_residuals(out: dict, station_id: str, model_label: str = "", lags: int = 20):
+    """
+    ACF-plot för residualerna (observation − one-step-ahead prediktion).
+    Stil matchar kompiskoden: enkel fetstil-titel, lodräta staplar,
+    streckade CI-linjer (ingen blå fyllning), grid.
+    """
+    obs  = out["observed_base"]
+    pred = out["filter_pred_base"].flatten()[:len(obs)]
+    residualer = obs - pred
+
+    residualer_series = pd.Series(residualer).dropna()
+    residualer_series = residualer_series[~np.isnan(residualer_series.values)]
+
+    if len(residualer_series) < 10:
+        print(f"⚠ För få residualer för ACF-plot ({model_label})")
+        return None
+
+    max_lags = min(lags, len(residualer_series) // 2 - 1)
+
+    # Beräkna ACF-värden och 95%-konfidensintervall (±1.96/√n)
+    acf_vals = sm_acf(residualer_series, nlags=max_lags, fft=True)
+    ci_bound = 1.96 / np.sqrt(len(residualer_series))
+    lags_arr = np.arange(len(acf_vals))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    # Lodräta staplar (stems) — blå, som kompisen
+    ax.vlines(lags_arr, 0, acf_vals, colors="steelblue", linewidth=1.5)
+    ax.plot(lags_arr, acf_vals, "o", color="steelblue", markersize=5)
+
+    # Baslinje vid 0
+    ax.axhline(0, color="black", linewidth=0.8)
+
+    # Streckade CI-linjer (som kompisen — inga fyllda band)
+    ax.axhline( ci_bound, linestyle="--", color="steelblue", linewidth=0.9)
+    ax.axhline(-ci_bound, linestyle="--", color="steelblue", linewidth=0.9)
+
+    # Enkel fetstil-titel som kompisen (ingen extra undertitel)
+    label_part = f" — {model_label}" if model_label else ""
+    ax.set_title(
+        f"ACF för residualer{label_part} ({station_id})",
+        fontsize=14, fontweight="bold"
+    )
+
+    ax.set_xlabel("Lag")
+    ax.set_ylabel("Autokorrelation")
+    ax.grid(True)
+
+    plt.tight_layout()
+    return fig
+
+
 # ─────────────────────────────────────────────
 #  IMPUTATION (saknade värden)
 # ─────────────────────────────────────────────
@@ -1069,230 +1266,288 @@ if __name__ == "__main__":
     # Välj vilket läge som ska köras: "baseline", "multi", eller "both"
     MODE = "both"
 
+    # Alla basrör som ska köras
+    STATIONS = [
+        (basror_22W102,  "22W102"),
+        (basror_17XX01U, "17XX01U"),
+        (basror_G1101,   "G1101"),
+    ]
+
+    for station_path, station_id in STATIONS:
+        print("\n" + "#"*60)
+        print(f"# KÖR STATION: {station_id}")
+        print("#"*60)
+
     # ── STEG 1: ALL DATAHÄMTNING FÖRST ────────────────────────────────────
     # (Samlar all nätverkskommunikation innan tung beräkning för att undvika
     #  att socketpooler/SSL-kontext störs av statsmodels/scipy.)
 
-    print("=== Laddar basröret ===")
-    base = load_base_station()
-    print(f"Basobjekt 22W102: {len(base)} rader, {base.isna().sum()} saknade värden")
+        print("=== Laddar basröret ===")
+        base = load_base_station(station_path)
+        print(f"Basobjekt {station_id}: {len(base)} rader, {base.isna().sum()} saknade värden")
 
-    # Hämta kandidatrör (samma akvifer+jordart) — används av både baslinje och multi
-    print("\n--- Hämtar kandidatrör från SGU API ---")
-    refs = load_candidate_stations(base)
+        # Hämta kandidatrör (samma akvifer+jordart) — används av både baslinje och multi
+        print("\n--- Hämtar kandidatrör från SGU API ---")
+        refs = load_candidate_stations(base, base_station_id=station_id, ignore_geology=False)
 
-    ref = None
-    df_base = None
-    baseline_ref_id = None
-    if MODE in ("baseline", "both"):
-        # Välj topp 1 via Pearson-korrelation (samma metod som multi)
-        df_top1 = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=1)
-        baseline_ref_id = [c for c in df_top1.columns if c != "base"][0]
-        ref = df_top1[baseline_ref_id]
-        # Bygg enkel baseline-dataframe med kolumnerna "base" och "ref"
-        df_base = df_top1.rename(columns={baseline_ref_id: "ref"})[["base", "ref"]]
-        print(f"\nBaslinjens referensrör: {baseline_ref_id} (högst |r| med basröret)")
+        ref = None
+        df_base = None
+        baseline_ref_id = None
+        if MODE in ("baseline", "both"):
+            # Välj topp 1 via Pearson-korrelation (samma metod som multi)
+            df_top1 = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=1)
+            baseline_ref_id = [c for c in df_top1.columns if c != "base"][0]
+            ref = df_top1[baseline_ref_id]
+            # Bygg enkel baseline-dataframe med kolumnerna "base" och "ref"
+            df_base = df_top1.rename(columns={baseline_ref_id: "ref"})[["base", "ref"]]
+            print(f"\nBaslinjens referensrör: {baseline_ref_id} (högst |r| med basröret)")
+            # Diagnostik: kontrollera extremvärden i referensröret
+            ref_vals = df_base["ref"].dropna()
+            print(f"  Referensrör {baseline_ref_id} — min: {ref_vals.min():.2f}, max: {ref_vals.max():.2f}, "
+                  f"median: {ref_vals.median():.2f}, saknade veckor: {df_base['ref'].isna().sum()}")
+            outlier_mask = (ref_vals < ref_vals.quantile(0.01)) | (ref_vals > ref_vals.quantile(0.99))
+            if outlier_mask.any():
+                print(f"  Potentiella outliers (utanför 1–99 percentil) i {baseline_ref_id}:")
+                print(f"  {ref_vals[outlier_mask].to_string()}")
 
-    df_multi = None
-    if MODE in ("multi", "both"):
-        df_multi = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=5)
+        df_multi = None
+        if MODE in ("multi", "both"):
+            df_multi = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=5)
 
-    print("\n✓ All data hämtad — startar modellanpassning\n")
+        print("\n✓ All data hämtad — startar modellanpassning\n")
 
-    # Initiera resultatvariabler
-    result_base = result_multi = None
-    out_base = out_multi = None
-    metrics_base = metrics_multi = None
+        # Initiera resultatvariabler
+        result_base = result_multi = None
+        out_base = out_multi = None
+        metrics_base = metrics_multi = None
 
-    # ── STEG 2: BASLINJEMODELL ────────────────────────────────────────────
-    if MODE in ("baseline", "both"):
-        print("="*60)
-        print(f"BASLINJEMODELL — ett referensrör ({baseline_ref_id})")
-        print("="*60)
-        print(f"\nGemensamt dataset: {len(df_base)} veckor "
-              f"({df_base.index[0].date()} – {df_base.index[-1].date()})")
-        print(f"Saknade i base: {df_base['base'].isna().sum()}")
-        print(f"Saknade i ref:  {df_base['ref'].isna().sum()}")
+        # ── STEG 2: BASLINJEMODELL ────────────────────────────────────────────
+        if MODE in ("baseline", "both"):
+            print("="*60)
+            print(f"BASLINJEMODELL — ett referensrör ({baseline_ref_id})")
+            print("="*60)
+            print(f"\nGemensamt dataset: {len(df_base)} veckor "
+                  f"({df_base.index[0].date()} – {df_base.index[-1].date()})")
+            print(f"Saknade i base: {df_base['base'].isna().sum()}")
+            print(f"Saknade i ref:  {df_base['ref'].isna().sum()}")
 
-        # Anpassa modellen
-        print("\n=== Anpassar baslinjemodellen ===")
-        result_base, model_base = fit_model_baseline(df_base, nseason=26)
+            # Anpassa modellen
+            print("\n=== Anpassar baslinjemodellen ===")
+            result_base, model_base = fit_model_baseline(df_base, nseason=26)
 
-        # Kör Kalman smoother + prognos (26 veckor = ~6 månader)
-        print("\n=== Kör Kalman smoother + prognos (baslinje) ===")
-        out_base = smooth_and_forecast(result_base, df_base, n_forecast=26)
+            # Kör Kalman smoother + prognos (26 veckor = ~6 månader)
+            print("\n=== Kör Kalman smoother + prognos (baslinje) ===")
+            out_base = smooth_and_forecast(result_base, df_base, n_forecast=26)
 
-        # Imputation-rapport
-        imputed_base = imputation_report(df_base, out_base)
+            # Imputation-rapport
+            imputed_base = imputation_report(df_base, out_base)
 
-        # Avvikelsedetektering
-        anomaly_base = detect_anomalies(
-            observed=out_base["observed_base"],
-            pred_ci=out_base["pred_ci"],
-            min_consecutive=3,
-        )
-        n_anom = anomaly_base.sum()
-        print(f"\nAvvikelsedetektering (baslinje): {n_anom} tidpunkter flaggade "
-              f"({n_anom/len(anomaly_base)*100:.1f}%)")
+            # Avvikelsedetektering
+            anomaly_base = detect_anomalies(
+                observed=out_base["observed_base"],
+                pred_ci=out_base["pred_ci"],
+                min_consecutive=3,
+            )
+            n_anom = anomaly_base.sum()
+            print(f"\nAvvikelsedetektering (baslinje): {n_anom} tidpunkter flaggade "
+                  f"({n_anom/len(anomaly_base)*100:.1f}%)")
 
-        # Plotta och spara
-        try:
-            print("\n=== Genererar plot (baslinje) ===")
-            fig_base = plot_results(out_base, anomaly_base, ref_label=baseline_ref_id)
-            fig_base.savefig("groundwater_ssm_baseline.png", dpi=150, bbox_inches="tight")
-            print("Plot sparad till: groundwater_ssm_baseline.png")
-            plt.close(fig_base)
-        except (Exception, KeyboardInterrupt) as e:
-            print(f"⚠ Plottning (baslinje) misslyckades: {type(e).__name__}: {e}")
-            plt.close("all")
+            # Plotta och spara
+            try:
+                print("\n=== Genererar plot (baslinje) ===")
+                fig_base = plot_results(out_base, anomaly_base, title_base=station_id, ref_label=baseline_ref_id, model_label="Baslinje")
+                fig_base.savefig(f"groundwater_ssm_baseline_{station_id}.png", dpi=150, bbox_inches="tight")
+                print(f"Plot sparad till: groundwater_ssm_baseline_{station_id}.png")
+                plt.close(fig_base)
 
-        # Spara imputerade värden
-        if not imputed_base.empty:
-            imputed_base.to_csv("imputed_values_baseline.csv")
-            print("Imputerade värden sparade till: imputed_values_baseline.csv")
+                # Akvifär-stil: observationer, prediktioner, osäkerhetsband
+                fig_akv = plot_akvifar_style(
+                    out_base, anomaly_base,
+                    title_base=station_id,
+                    ref_label=baseline_ref_id,
+                    model_label="State Space"
+                )
+                fig_akv.savefig(f"akvifar_style_baseline_{station_id}.png", dpi=150, bbox_inches="tight")
+                print(f"Akvifär-stilplot sparad till: akvifar_style_baseline_{station_id}.png")
+                plt.close(fig_akv)
 
-        # Skattade parametrar
-        print("\n=== Skattade parametrar (baslinje) ===")
-        params_base = dict(zip(model_base.param_names, result_base.params))
-        for k, v in params_base.items():
-            print(f"  {k:<28} = {v:.6f}")
+                # ACF-plot för baslinje
+                fig_acf = plot_acf_residuals(out_base, station_id=station_id, model_label="State Space")
+                if fig_acf is not None:
+                    fig_acf.savefig(f"acf_residuals_baseline_{station_id}.png", dpi=150, bbox_inches="tight")
+                    print(f"ACF-plot sparad till: acf_residuals_baseline_{station_id}.png")
+                    plt.close(fig_acf)
+            except (Exception, KeyboardInterrupt) as e:
+                print(f"⚠ Plottning (baslinje) misslyckades: {type(e).__name__}: {e}")
+                plt.close("all")
 
+            # Spara imputerade värden
+            if not imputed_base.empty:
+                imputed_base.to_csv(f"imputed_values_baseline_{station_id}.csv")
+                print(f"Imputerade värden sparade till: imputed_values_baseline_{station_id}.csv")
 
-    # ── STEG 3: MULTIVARIAT MODELL ────────────────────────────────────────
-    if MODE in ("multi", "both"):
-        print("\n" + "="*60)
-        print("MULTIVARIAT MODELL — referensrör filtrerade på akvifer+jordart")
-        print("="*60)
-        # ref_ids hämtas från df_multi efter max_refs-begränsning (inte från refs-listan)
-        ref_ids = [col for col in df_multi.columns if col != "base"]
-        print(f"\nAnvänder {len(ref_ids)} referensrör: {ref_ids}")
-        print(f"Gemensamt dataset: {len(df_multi)} veckor "
-              f"({df_multi.index[0].date()} – {df_multi.index[-1].date()})")
-        print(f"Saknade i base: {df_multi['base'].isna().sum()}")
-        for rid in ref_ids:
-            print(f"Saknade i {rid}: {df_multi[rid].isna().sum()}")
-
-        # Anpassa modellen
-        print("\n=== Anpassar multivariat modell ===")
-        result_multi, model_multi = fit_model_multi(df_multi, nseason=26)
-
-        # Kör Kalman smoother + prognos (26 veckor = ~6 månader)
-        print("\n=== Kör Kalman smoother + prognos (multivariat) ===")
-        out_multi = smooth_and_forecast(result_multi, df_multi, n_forecast=26)
-
-        # Imputation-rapport
-        imputed_multi = imputation_report(df_multi, out_multi)
-
-        # Avvikelsedetektering
-        anomaly_multi = detect_anomalies(
-            observed=out_multi["observed_base"],
-            pred_ci=out_multi["pred_ci"],
-            min_consecutive=3,
-        )
-        n_anom = anomaly_multi.sum()
-        print(f"\nAvvikelsedetektering (multivariat): {n_anom} tidpunkter flaggade "
-              f"({n_anom/len(anomaly_multi)*100:.1f}%)")
-
-        # Plotta och spara
-        try:
-            print("\n=== Genererar plot (multivariat) ===")
-            fig_multi = plot_results(out_multi, anomaly_multi,
-                                     ref_label=", ".join(ref_ids))
-            fig_multi.savefig("groundwater_ssm_multi.png", dpi=150, bbox_inches="tight")
-            print("Plot sparad till: groundwater_ssm_multi.png")
-            plt.close(fig_multi)
-        except (Exception, KeyboardInterrupt) as e:
-            print(f"⚠ Plottning (multi) misslyckades: {type(e).__name__}: {e}")
-            plt.close("all")
-
-        # Spara imputerade värden
-        if not imputed_multi.empty:
-            imputed_multi.to_csv("imputed_values_multi.csv")
-            print("Imputerade värden sparade till: imputed_values_multi.csv")
-
-        # Skattade parametrar
-        print("\n=== Skattade parametrar (multivariat) ===")
-        params_multi = dict(zip(model_multi.param_names, result_multi.params))
-        for k, v in params_multi.items():
-            print(f"  {k:<40} = {v:.6f}")
+            # Skattade parametrar
+            print("\n=== Skattade parametrar (baslinje) ===")
+            params_base = dict(zip(model_base.param_names, result_base.params))
+            for k, v in params_base.items():
+                print(f"  {k:<28} = {v:.6f}")
 
 
-    # ── UTVÄRDERING & JÄMFÖRELSE ──────────────────────────────────────
-    if MODE in ("baseline", "both") and result_base is not None:
-        metrics_base = evaluate_model(result_base, out_base,
-                                      label="Baslinje")
-    if MODE in ("multi", "both") and result_multi is not None:
-        metrics_multi = evaluate_model(result_multi, out_multi,
-                                       label="Multivariat")
+        # ── STEG 3: MULTIVARIAT MODELL ────────────────────────────────────────
+        if MODE in ("multi", "both") and df_multi["base"].notna().sum() < 3:
+            print(f"\n⚠ OBS: Färre än 3 observationer i basröret för {station_id} — kör ändå multivariat modell.")
+        if MODE in ("multi", "both"):
+            print("\n" + "="*60)
+            print("MULTIVARIAT MODELL — referensrör filtrerade på akvifer+jordart")
+            print("="*60)
+            # ref_ids hämtas från df_multi efter max_refs-begränsning (inte från refs-listan)
+            ref_ids = [col for col in df_multi.columns if col != "base"]
+            print(f"\nAnvänder {len(ref_ids)} referensrör: {ref_ids}")
+            print(f"Gemensamt dataset: {len(df_multi)} veckor "
+                  f"({df_multi.index[0].date()} – {df_multi.index[-1].date()})")
+            print(f"Saknade i base: {df_multi['base'].isna().sum()}")
+            for rid in ref_ids:
+                print(f"Saknade i {rid}: {df_multi[rid].isna().sum()}")
 
-    if MODE == "both":
-        print("\n" + "="*60)
-        print("JÄMFÖRELSE: Baslinje vs Multivariat")
-        print("="*60)
+            # Anpassa modellen
+            print("\n=== Anpassar multivariat modell ===")
+            result_multi, model_multi = fit_model_multi(df_multi, nseason=26)
 
-        # Samla alla modeller som körts
-        all_metrics = []
-        labels = []
-        if metrics_base is not None:
-            all_metrics.append(metrics_base); labels.append("Baslinje")
-        if metrics_multi is not None:
-            all_metrics.append(metrics_multi); labels.append("Multi")
+            # Kör Kalman smoother + prognos (26 veckor = ~6 månader)
+            print("\n=== Kör Kalman smoother + prognos (multivariat) ===")
+            out_multi = smooth_and_forecast(result_multi, df_multi, n_forecast=26)
 
-        comparison_keys = [
-            ("── Modellanpassning ──", None),
-            ("Log-likelihood", "{:>12.2f}"),
-            ("AIC", "{:>12.2f}"),
-            ("BIC", "{:>12.2f}"),
-            ("HQIC", "{:>12.2f}"),
-            ("Antal parametrar", "{:>12.0f}"),
-            ("── Prediktionsfel (one-step-ahead) ──", None),
-            ("RMSE", "{:>12.6f}"),
-            ("MAE", "{:>12.6f}"),
-            ("ME (bias)", "{:>12.6f}"),
-            ("95%-täckning", "{:>11.1%}"),
-            ("── Antagande 2: Okorrelerade feltermer ──", None),
-            ("Innov. medel", "{:>12.4f}"),
-            ("Ljung-Box Q(10)", "{:>12.4f}"),
-            ("Ljung-Box p", "{:>12.4f}"),
-            ("Durbin-Watson", "{:>12.4f}"),
-        ]
+            # Imputation-rapport
+            imputed_multi = imputation_report(df_multi, out_multi)
 
-        # Dynamisk header för valfritt antal modeller
-        header = f"  {'Mått':<35}"
-        for lbl in labels:
-            header += f" {lbl:>14}"
-        header += "  Bäst"
-        print(f"\n{header}")
-        print(f"  {'-'*(35 + 15*len(labels) + 6)}")
+            # Avvikelsedetektering
+            anomaly_multi = detect_anomalies(
+                observed=out_multi["observed_base"],
+                pred_ci=out_multi["pred_ci"],
+                min_consecutive=3,
+            )
+            n_anom = anomaly_multi.sum()
+            print(f"\nAvvikelsedetektering (multivariat): {n_anom} tidpunkter flaggade "
+                  f"({n_anom/len(anomaly_multi)*100:.1f}%)")
 
-        lower_is_better  = {"AIC", "BIC", "HQIC", "RMSE", "MAE",
-                            "Ljung-Box Q(10)"}
-        higher_is_better = {"Log-likelihood", "95%-täckning",
-                            "Ljung-Box p"}
-        target_value     = {"ME (bias)": 0.0, "Innov. medel": 0.0,
-                            "Durbin-Watson": 2.0}
+            # Plotta och spara
+            try:
+                print("\n=== Genererar plot (multivariat) ===")
+                fig_multi = plot_results(out_multi, anomaly_multi,
+                                         title_base=station_id, ref_label=", ".join(ref_ids), model_label="Multivariat")
+                fig_multi.savefig(f"groundwater_ssm_multi_{station_id}.png", dpi=150, bbox_inches="tight")
+                print(f"Plot sparad till: groundwater_ssm_multi_{station_id}.png")
+                plt.close(fig_multi)
 
-        for key, fmt in comparison_keys:
-            if fmt is None:
-                print(f"\n  {key}")
-                continue
-            vals = [m.get(key) for m in all_metrics]
-            if all(v is None for v in vals):
-                continue
-            row = f"  {key:<35}"
-            for v in vals:
-                row += f" {fmt.format(v) if v is not None else 'N/A':>14}"
+                # Akvifär-stil för multivariat
+                fig_akv_multi = plot_akvifar_style(
+                    out_multi, anomaly_multi,
+                    title_base=station_id,
+                    ref_label=", ".join(ref_ids),
+                    model_label="State Space Multivariat"
+                )
+                fig_akv_multi.savefig(f"akvifar_style_multi_{station_id}.png", dpi=150, bbox_inches="tight")
+                print(f"Akvifär-stilplot sparad till: akvifar_style_multi_{station_id}.png")
+                plt.close(fig_akv_multi)
 
-            # Bestäm bästa modellen
-            valid_vals = [(v, lbl) for v, lbl in zip(vals, labels) if v is not None]
-            winner = ""
-            if len(valid_vals) >= 2:
-                if key in lower_is_better:
-                    winner = min(valid_vals, key=lambda x: x[0])[1]
-                elif key in higher_is_better:
-                    winner = max(valid_vals, key=lambda x: x[0])[1]
-                elif key in target_value:
-                    t = target_value[key]
-                    winner = min(valid_vals, key=lambda x: abs(x[0] - t))[1]
-            row += f"  {winner}"
-            print(row)
+                # ACF-plot för multivariat
+                fig_acf_multi = plot_acf_residuals(out_multi, station_id=station_id, model_label="State Space Multivariat")
+                if fig_acf_multi is not None:
+                    fig_acf_multi.savefig(f"acf_residuals_multi_{station_id}.png", dpi=150, bbox_inches="tight")
+                    print(f"ACF-plot sparad till: acf_residuals_multi_{station_id}.png")
+                    plt.close(fig_acf_multi)
+            except (Exception, KeyboardInterrupt) as e:
+                print(f"⚠ Plottning (multi) misslyckades: {type(e).__name__}: {e}")
+                plt.close("all")
+
+            # Spara imputerade värden
+            if not imputed_multi.empty:
+                imputed_multi.to_csv(f"imputed_values_multi_{station_id}.csv")
+                print(f"Imputerade värden sparade till: imputed_values_multi_{station_id}.csv")
+
+            # Skattade parametrar
+            print("\n=== Skattade parametrar (multivariat) ===")
+            params_multi = dict(zip(model_multi.param_names, result_multi.params))
+            for k, v in params_multi.items():
+                print(f"  {k:<40} = {v:.6f}")
+
+
+        # ── UTVÄRDERING & JÄMFÖRELSE ──────────────────────────────────────
+        if MODE in ("baseline", "both") and result_base is not None:
+            metrics_base = evaluate_model(result_base, out_base,
+                                          label="Baslinje", station_id=station_id)
+        if MODE in ("multi", "both") and result_multi is not None:
+            metrics_multi = evaluate_model(result_multi, out_multi,
+                                           label="Multivariat", station_id=station_id)
+
+        if MODE == "both":
+            print("\n" + "="*60)
+            print(f"JÄMFÖRELSE: Baslinje vs Multivariat — {station_id}")
+            print("="*60)
+
+            # Samla alla modeller som körts
+            all_metrics = []
+            labels = []
+            if metrics_base is not None:
+                all_metrics.append(metrics_base); labels.append("Baslinje")
+            if metrics_multi is not None:
+                all_metrics.append(metrics_multi); labels.append("Multi")
+
+            comparison_keys = [
+                ("── Modellanpassning ──", None),
+                ("Log-likelihood", "{:>12.2f}"),
+                ("AIC", "{:>12.2f}"),
+                ("BIC", "{:>12.2f}"),
+                ("HQIC", "{:>12.2f}"),
+                ("Antal parametrar", "{:>12.0f}"),
+                ("── Prediktionsfel (one-step-ahead) ──", None),
+                ("RMSE", "{:>12.6f}"),
+                ("MAE", "{:>12.6f}"),
+                ("ME (bias)", "{:>12.6f}"),
+                ("95%-täckning", "{:>11.1%}"),
+                ("── Antagande 2: Okorrelerade feltermer ──", None),
+                ("Innov. medel", "{:>12.4f}"),
+                ("Ljung-Box Q(10)", "{:>12.4f}"),
+                ("Ljung-Box p", "{:>12.4f}"),
+                ("Durbin-Watson", "{:>12.4f}"),
+            ]
+
+            # Dynamisk header för valfritt antal modeller
+            header = f"  {'Mått':<35}"
+            for lbl in labels:
+                header += f" {lbl:>14}"
+            header += "  Bäst"
+            print(f"\n{header}")
+            print(f"  {'-'*(35 + 15*len(labels) + 6)}")
+
+            lower_is_better  = {"AIC", "BIC", "HQIC", "RMSE", "MAE",
+                                "Ljung-Box Q(10)"}
+            higher_is_better = {"Log-likelihood", "95%-täckning",
+                                "Ljung-Box p"}
+            target_value     = {"ME (bias)": 0.0, "Innov. medel": 0.0,
+                                "Durbin-Watson": 2.0}
+
+            for key, fmt in comparison_keys:
+                if fmt is None:
+                    print(f"\n  {key}")
+                    continue
+                vals = [m.get(key) for m in all_metrics]
+                if all(v is None for v in vals):
+                    continue
+                row = f"  {key:<35}"
+                for v in vals:
+                    row += f" {fmt.format(v) if v is not None else 'N/A':>14}"
+
+                # Bestäm bästa modellen
+                valid_vals = [(v, lbl) for v, lbl in zip(vals, labels) if v is not None]
+                winner = ""
+                if len(valid_vals) >= 2:
+                    if key in lower_is_better:
+                        winner = min(valid_vals, key=lambda x: x[0])[1]
+                    elif key in higher_is_better:
+                        winner = max(valid_vals, key=lambda x: x[0])[1]
+                    elif key in target_value:
+                        t = target_value[key]
+                        winner = min(valid_vals, key=lambda x: abs(x[0] - t))[1]
+                row += f"  {winner}"
+                print(row)
